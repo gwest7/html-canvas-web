@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Spider web</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f3efe6;
+      --muted: #b7b1a6;
+      --gold: #e4c27a;
+      --gold-ink: #241b0c;
+      --panel: rgba(10, 11, 14, 0.78);
+      --line: rgba(243, 239, 230, 0.14);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #090a0d;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100dvh;
+      touch-action: none;
+      cursor: crosshair;
+    }
+
+    canvas.woven { cursor: grab; }
+    canvas.grabbing { cursor: grabbing; }
+
+    .hud {
+      position: fixed;
+      z-index: 2;
+      top: 18px;
+      left: 18px;
+      width: min(320px, calc(100vw - 36px));
+      padding: 14px 14px 12px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      color: var(--ink);
+      font: 15px/1.45 "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+      pointer-events: none;
+      backdrop-filter: blur(12px);
+    }
+
+    .hud h1 {
+      margin: 0 0 4px;
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+    }
+
+    .hud p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .count {
+      margin-top: 8px !important;
+      color: var(--ink) !important;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+      pointer-events: auto;
+    }
+
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--ink);
+      font: inherit;
+      font-size: 14px;
+      border-radius: 999px;
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+
+    button:focus-visible {
+      outline: 2px solid var(--gold);
+      outline-offset: 2px;
+    }
+
+    button.primary {
+      background: var(--gold);
+      border-color: transparent;
+      color: var(--gold-ink);
+    }
+
+    button:disabled {
+      opacity: 0.38;
+      cursor: default;
+    }
+
+    @media (max-width: 640px) {
+      .hud {
+        top: auto;
+        bottom: 12px;
+        left: 12px;
+        width: calc(100vw - 24px);
+      }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="web" aria-label="Spider web. Click to place anchors, then weave."></canvas>
+  <div class="hud">
+    <h1>Spider silk</h1>
+    <p id="hint">Click to place anchors. Five or more, then weave.</p>
+    <p class="count" id="count">0 points</p>
+    <div class="row">
+      <button id="weave" class="primary" type="button" disabled>Weave web</button>
+      <button id="clear" type="button">Clear</button>
+    </div>
+  </div>
+  <script>
+    const MIN_POINTS = 5;
+    const MAX_POINTS = 40;
+    const TURNS = 6;
+    const DUPLICATE_PX = 14;
+    const SPIRAL_PARTS = 5;
+    const RADIAL_PARTS = 1;
+
+    const canvas = document.getElementById("web");
+    const ctx = canvas.getContext("2d");
+    const hintEl = document.getElementById("hint");
+    const countEl = document.getElementById("count");
+    const weaveBtn = document.getElementById("weave");
+    const clearBtn = document.getElementById("clear");
+
+    const anchors = [];
+    let nodes = [];
+    let springs = [];
+    let mode = "place";
+    let cssW = 1;
+    let cssH = 1;
+    let pointer = null;
+    let placeDown = null;
+    let drag = null;
+    let hoverIndex = -1;
+    let hubIndex = 0;
+
+    const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    let reduceMotion = motionQuery.matches;
+    motionQuery.addEventListener?.("change", (event) => {
+      reduceMotion = event.matches;
+    });
+
+    function resize() {
+      const oldW = cssW;
+      const oldH = cssH;
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      cssW = window.innerWidth;
+      cssH = window.innerHeight;
+      canvas.width = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      if (mode === "woven" && oldW > 1 && oldH > 1 && (oldW !== cssW || oldH !== cssH)) {
+        const sx = cssW / oldW;
+        const sy = cssH / oldH;
+        for (const node of nodes) {
+          const offX = node.x - node.restX;
+          const offY = node.y - node.restY;
+          const prevX = node.ox - node.restX;
+          const prevY = node.oy - node.restY;
+          node.restX = node.nx * cssW;
+          node.restY = node.ny * cssH;
+          node.x = node.restX + offX * sx;
+          node.y = node.restY + offY * sy;
+          node.ox = node.restX + prevX * sx;
+          node.oy = node.restY + prevY * sy;
+          if (node.pinned) {
+            node.x = node.ox = node.restX;
+            node.y = node.oy = node.restY;
+          }
+        }
+        for (const spring of springs) {
+          const a = nodes[spring.a];
+          const b = nodes[spring.b];
+          spring.rest = Math.hypot(b.restX - a.restX, b.restY - a.restY);
+        }
+      }
+    }
+
+    function updateHud() {
+      const count = anchors.length;
+      const noun = count === 1 ? "point" : "points";
+      if (mode === "woven") {
+        countEl.textContent = `${count} ${noun} · silk is live`;
+        hintEl.textContent = "Drag a node and release it. Loose silk droops, and tight silk pulls taut.";
+        weaveBtn.textContent = "Woven";
+        weaveBtn.disabled = true;
+        canvas.classList.add("woven");
+        canvas.setAttribute("aria-label", "Woven spider web. Drag a node and release it.");
+      } else {
+        const more = Math.max(0, MIN_POINTS - count);
+        countEl.textContent = more > 0 ? `${count} ${noun} · ${more} more to weave` : `${count} ${noun}`;
+        if (count >= MAX_POINTS) {
+          hintEl.textContent = "Forty anchors is the limit. Weave when you are ready.";
+        } else {
+          hintEl.textContent = "Click to place anchors. Five or more, then weave.";
+        }
+        weaveBtn.textContent = "Weave web";
+        weaveBtn.disabled = count < MIN_POINTS;
+        canvas.classList.remove("woven");
+        canvas.setAttribute("aria-label", "Spider web. Click to place anchors, then weave.");
+      }
+    }
+
+    function addAnchor(x, y) {
+      if (mode !== "place" || anchors.length >= MAX_POINTS) return false;
+      for (const anchor of anchors) {
+        const dx = anchor.nx * cssW - x;
+        const dy = anchor.ny * cssH - y;
+        if (dx * dx + dy * dy < DUPLICATE_PX * DUPLICATE_PX) return false;
+      }
+      anchors.push({ nx: x / cssW, ny: y / cssH });
+      updateHud();
+      return true;
+    }
+
+    function makeNode(x, y, pinned) {
+      return {
+        x, y, ox: x, oy: y,
+        restX: x, restY: y,
+        nx: x / cssW, ny: y / cssH,
+        pinned
+      };
+    }
+
+    function weave() {
+      if (anchors.length < MIN_POINTS || mode === "woven") return;
+      const count = anchors.length;
+      let cx = 0;
+      let cy = 0;
+      for (const anchor of anchors) {
+        cx += anchor.nx;
+        cy += anchor.ny;
+      }
+      cx /= count;
+      cy /= count;
+
+      const sorted = anchors.map((anchor, index) => ({
+        ...anchor,
+        index,
+        angle: Math.atan2(anchor.ny - cy, anchor.nx - cx)
+      })).sort((a, b) => a.angle - b.angle || a.index - b.index);
+
+      const hx = cx * cssW;
+      const hy = cy * cssH;
+      nodes = [makeNode(hx, hy, false)];
+      hubIndex = 0;
+
+      const dirs = [];
+      const spokeNodes = Array.from({ length: count }, () => []);
+      for (let i = 0; i < count; i++) {
+        const anchor = sorted[i];
+        let vx = anchor.nx * cssW - hx;
+        let vy = anchor.ny * cssH - hy;
+        const span = Math.hypot(vx, vy);
+        if (span < 8) {
+          const angle = anchor.angle || (i / count) * Math.PI * 2;
+          vx = Math.cos(angle) * 8;
+          vy = Math.sin(angle) * 8;
+        }
+        dirs.push({ x: vx, y: vy });
+      }
+
+      // One capture spiral: radius grows with every step around the hub,
+      // so the cross strands wind outward instead of closing into rings.
+      const steps = count * TURNS;
+      const spiralIds = [];
+      for (let s = 0; s < steps; s++) {
+        const i = s % count;
+        const t = 0.07 + 0.86 * (s / (steps - 1));
+        const id = nodes.length;
+        nodes.push(makeNode(hx + dirs[i].x * t, hy + dirs[i].y * t, false));
+        spokeNodes[i].push(id);
+        spiralIds.push(id);
+      }
+      for (let i = 0; i < count; i++) {
+        const id = nodes.length;
+        nodes.push(makeNode(hx + dirs[i].x, hy + dirs[i].y, true));
+        spokeNodes[i].push(id);
+      }
+
+      springs = [];
+      // Ropes only resist stretch. Slack length can hang in a curve.
+      const linkRope = (a, b, kind, stiff, parts, tensionOnly) => {
+        const ax = nodes[a].x;
+        const ay = nodes[a].y;
+        const bx = nodes[b].x;
+        const by = nodes[b].y;
+        let prev = a;
+        for (let i = 1; i <= parts; i++) {
+          const t = i / parts;
+          let id = b;
+          if (i < parts) {
+            id = nodes.length;
+            nodes.push(makeNode(ax + (bx - ax) * t, ay + (by - ay) * t, false));
+          }
+          const na = nodes[prev];
+          const nb = nodes[id];
+          const rest = Math.hypot(nb.x - na.x, nb.y - na.y);
+          if (rest >= 0.5) {
+            springs.push({
+              a: prev,
+              b: id,
+              rest,
+              kind,
+              stiff,
+              compress: tensionOnly ? 0 : 1,
+              tensionOnly
+            });
+          }
+          prev = id;
+        }
+      };
+
+      for (let i = 0; i < count; i++) {
+        const spoke = spokeNodes[i];
+        linkRope(hubIndex, spoke[0], "radial", 1, RADIAL_PARTS, false);
+        for (let k = 0; k < spoke.length - 1; k++) {
+          linkRope(spoke[k], spoke[k + 1], "radial", 1, RADIAL_PARTS, false);
+        }
+      }
+
+      for (let s = 0; s < spiralIds.length - 1; s++) {
+        linkRope(spiralIds[s], spiralIds[s + 1], "spiral", 0.88, SPIRAL_PARTS, true);
+      }
+
+      mode = "woven";
+      updateHud();
+    }
+
+    function clearAll() {
+      anchors.length = 0;
+      nodes = [];
+      springs = [];
+      mode = "place";
+      pointer = null;
+      drag = null;
+      hoverIndex = -1;
+      canvas.classList.remove("grabbing");
+      updateHud();
+    }
+
+    function nearestNode(x, y) {
+      let best = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < nodes.length; i++) {
+        const node = nodes[i];
+        const dist = Math.hypot(node.x - x, node.y - y);
+        if (dist < bestDist) {
+          best = i;
+          bestDist = dist;
+        }
+      }
+      return best;
+    }
+
+    function holdDragged() {
+      if (!drag || !pointer) return;
+      const node = nodes[drag.index];
+      if (!node) return;
+      node.x = node.ox = pointer.x;
+      node.y = node.oy = pointer.y;
+    }
+
+    function step() {
+      if (mode !== "woven") return;
+      const damp = reduceMotion ? 0.62 : 0.96;
+      const gravity = reduceMotion ? 0.02 : 0.12;
+      const held = drag ? nodes[drag.index] : null;
+
+      for (const node of nodes) {
+        if (node === held) {
+          holdDragged();
+          continue;
+        }
+        if (node.pinned) {
+          node.x = node.ox = node.restX;
+          node.y = node.oy = node.restY;
+          continue;
+        }
+        const vx = (node.x - node.ox) * damp;
+        const vy = (node.y - node.oy) * damp;
+        node.ox = node.x;
+        node.oy = node.y;
+        node.x += vx;
+        node.y += vy + gravity;
+      }
+
+      const passes = reduceMotion ? 4 : 10;
+      for (let pass = 0; pass < passes; pass++) {
+        for (const spring of springs) {
+          const a = nodes[spring.a];
+          const b = nodes[spring.b];
+          const aHeld = a === held;
+          const bHeld = b === held;
+          if ((a.pinned || aHeld) && (b.pinned || bHeld)) continue;
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist < 1e-4) continue;
+          const stretched = dist > spring.rest;
+          if (!stretched && spring.tensionOnly) continue;
+          const diff = (dist - spring.rest) / dist;
+          const imA = a.pinned || aHeld ? 0 : 1;
+          const imB = b.pinned || bHeld ? 0 : 1;
+          const response = stretched ? spring.stiff : spring.compress;
+          const corr = diff * response / (imA + imB);
+          dx *= corr;
+          dy *= corr;
+          a.x += dx * imA;
+          a.y += dy * imA;
+          b.x -= dx * imB;
+          b.y -= dy * imB;
+        }
+      }
+
+      for (const node of nodes) {
+        if (node === held) {
+          holdDragged();
+          continue;
+        }
+        if (!node.pinned) continue;
+        node.x = node.ox = node.restX;
+        node.y = node.oy = node.restY;
+      }
+    }
+
+    function strandStyle(spring) {
+      const a = nodes[spring.a];
+      const b = nodes[spring.b];
+      const dist = Math.hypot(b.x - a.x, b.y - a.y);
+      const stretch = Math.max(0, dist - spring.rest) / Math.max(spring.rest, 1);
+      const tension = Math.min(1, stretch * 3.2);
+      const width = spring.kind === "spiral" ? 1.2 : 1.05;
+      return { alpha: 0.9, width: width + tension * 0.55 };
+    }
+
+    function drawBackground() {
+      let hx = cssW * 0.5;
+      let hy = cssH * 0.5;
+      if (mode === "woven" && nodes[hubIndex]) {
+        hx = nodes[hubIndex].restX;
+        hy = nodes[hubIndex].restY;
+      }
+      const gradient = ctx.createRadialGradient(hx, hy, 20, hx, hy, Math.max(cssW, cssH) * 0.72);
+      gradient.addColorStop(0, "#1c1e26");
+      gradient.addColorStop(1, "#090a0d");
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, cssW, cssH);
+    }
+
+    function drawAnchor(x, y, woven) {
+      ctx.beginPath();
+      ctx.arc(x, y, woven ? 3.2 : 5, 0, Math.PI * 2);
+      ctx.fillStyle = "#e4c27a";
+      ctx.fill();
+      if (!woven) {
+        ctx.beginPath();
+        ctx.arc(x, y, 9, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(228, 194, 122, 0.45)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+
+    function draw() {
+      drawBackground();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+
+      if (mode === "place") {
+        for (const anchor of anchors) drawAnchor(anchor.nx * cssW, anchor.ny * cssH, false);
+        return;
+      }
+
+      for (const spring of springs) {
+        const style = strandStyle(spring);
+        const a = nodes[spring.a];
+        const b = nodes[spring.b];
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.strokeStyle = `rgba(255, 255, 255, ${style.alpha})`;
+        ctx.lineWidth = style.width;
+        ctx.stroke();
+      }
+
+      const hub = nodes[hubIndex];
+      ctx.beginPath();
+      ctx.arc(hub.x, hub.y, 2.4, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffffff";
+      ctx.fill();
+
+      for (const node of nodes) {
+        if (node.pinned) drawAnchor(node.x, node.y, true);
+      }
+
+      const marked = drag ? drag.index : hoverIndex;
+      if (marked >= 0 && nodes[marked]) {
+        const node = nodes[marked];
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, 8, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+        ctx.lineWidth = 1.25;
+        ctx.stroke();
+      }
+    }
+
+    function frame() {
+      step();
+      draw();
+      requestAnimationFrame(frame);
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      const x = event.clientX;
+      const y = event.clientY;
+      pointer = { x, y };
+      canvas.setPointerCapture(event.pointerId);
+      if (mode === "woven") {
+        drag = { id: event.pointerId, index: nearestNode(x, y) };
+        hoverIndex = drag.index;
+        holdDragged();
+        canvas.classList.add("grabbing");
+        return;
+      }
+      placeDown = { id: event.pointerId, x, y };
+    });
+
+    canvas.addEventListener("pointerenter", (event) => {
+      pointer = { x: event.clientX, y: event.clientY };
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      const x = event.clientX;
+      const y = event.clientY;
+      pointer = { x, y };
+      if (drag && drag.id === event.pointerId) {
+        holdDragged();
+        return;
+      }
+      if (mode === "woven") hoverIndex = nearestNode(x, y);
+    });
+
+    canvas.addEventListener("pointerup", (event) => {
+      if (drag && drag.id === event.pointerId) {
+        drag = null;
+        canvas.classList.remove("grabbing");
+        return;
+      }
+      if (!placeDown || placeDown.id !== event.pointerId) return;
+      const travel = Math.hypot(event.clientX - placeDown.x, event.clientY - placeDown.y);
+      placeDown = null;
+      if (mode === "place" && travel < 7) addAnchor(event.clientX, event.clientY);
+    });
+
+    canvas.addEventListener("pointercancel", () => {
+      placeDown = null;
+      drag = null;
+      canvas.classList.remove("grabbing");
+    });
+
+    canvas.addEventListener("pointerleave", () => {
+      if (drag) return;
+      pointer = null;
+      hoverIndex = -1;
+    });
+
+    canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+
+    weaveBtn.addEventListener("click", weave);
+    clearBtn.addEventListener("click", clearAll);
+
+    window.addEventListener("resize", resize);
+    window.visualViewport?.addEventListener("resize", resize);
+
+    resize();
+    updateHud();
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
