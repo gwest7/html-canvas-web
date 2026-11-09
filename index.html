@@ -130,6 +130,8 @@
     const MAX_POINTS = 40;
     const TURNS = 6;
     const DUPLICATE_PX = 14;
+    const SPIRAL_PARTS = 5;
+    const RADIAL_PARTS = 1;
 
     const canvas = document.getElementById("web");
     const ctx = canvas.getContext("2d");
@@ -198,7 +200,7 @@
       const noun = count === 1 ? "point" : "points";
       if (mode === "woven") {
         countEl.textContent = `${count} ${noun} · silk is live`;
-        hintEl.textContent = "Drag a node, then release it. The silk springs back.";
+        hintEl.textContent = "Drag a node and release it. Loose silk droops, and tight silk pulls taut.";
         weaveBtn.textContent = "Woven";
         weaveBtn.disabled = true;
         canvas.classList.add("woven");
@@ -296,24 +298,48 @@
       }
 
       springs = [];
-      const link = (a, b, kind, stiff) => {
-        const na = nodes[a];
-        const nb = nodes[b];
-        const rest = Math.hypot(nb.x - na.x, nb.y - na.y);
-        if (rest < 0.5) return;
-        springs.push({ a, b, rest, kind, stiff });
+      // Ropes only resist stretch. Slack length can hang in a curve.
+      const linkRope = (a, b, kind, stiff, parts, tensionOnly) => {
+        const ax = nodes[a].x;
+        const ay = nodes[a].y;
+        const bx = nodes[b].x;
+        const by = nodes[b].y;
+        let prev = a;
+        for (let i = 1; i <= parts; i++) {
+          const t = i / parts;
+          let id = b;
+          if (i < parts) {
+            id = nodes.length;
+            nodes.push(makeNode(ax + (bx - ax) * t, ay + (by - ay) * t, false));
+          }
+          const na = nodes[prev];
+          const nb = nodes[id];
+          const rest = Math.hypot(nb.x - na.x, nb.y - na.y);
+          if (rest >= 0.5) {
+            springs.push({
+              a: prev,
+              b: id,
+              rest,
+              kind,
+              stiff,
+              compress: tensionOnly ? 0 : 1,
+              tensionOnly
+            });
+          }
+          prev = id;
+        }
       };
 
       for (let i = 0; i < count; i++) {
         const spoke = spokeNodes[i];
-        link(hubIndex, spoke[0], "radial", 0.46);
+        linkRope(hubIndex, spoke[0], "radial", 1, RADIAL_PARTS, false);
         for (let k = 0; k < spoke.length - 1; k++) {
-          link(spoke[k], spoke[k + 1], "radial", 0.46);
+          linkRope(spoke[k], spoke[k + 1], "radial", 1, RADIAL_PARTS, false);
         }
       }
 
       for (let s = 0; s < spiralIds.length - 1; s++) {
-        link(spiralIds[s], spiralIds[s + 1], "spiral", 0.28);
+        linkRope(spiralIds[s], spiralIds[s + 1], "spiral", 0.88, SPIRAL_PARTS, true);
       }
 
       mode = "woven";
@@ -356,8 +382,8 @@
 
     function step() {
       if (mode !== "woven") return;
-      const damp = reduceMotion ? 0.62 : 0.972;
-      const restPull = reduceMotion ? 0.22 : 0.012;
+      const damp = reduceMotion ? 0.62 : 0.96;
+      const gravity = reduceMotion ? 0.02 : 0.12;
       const held = drag ? nodes[drag.index] : null;
 
       for (const node of nodes) {
@@ -375,12 +401,10 @@
         node.ox = node.x;
         node.oy = node.y;
         node.x += vx;
-        node.y += vy;
-        node.x += (node.restX - node.x) * restPull;
-        node.y += (node.restY - node.y) * restPull;
+        node.y += vy + gravity;
       }
 
-      const passes = reduceMotion ? 3 : 4;
+      const passes = reduceMotion ? 4 : 10;
       for (let pass = 0; pass < passes; pass++) {
         for (const spring of springs) {
           const a = nodes[spring.a];
@@ -392,10 +416,13 @@
           let dy = b.y - a.y;
           const dist = Math.hypot(dx, dy);
           if (dist < 1e-4) continue;
+          const stretched = dist > spring.rest;
+          if (!stretched && spring.tensionOnly) continue;
           const diff = (dist - spring.rest) / dist;
           const imA = a.pinned || aHeld ? 0 : 1;
           const imB = b.pinned || bHeld ? 0 : 1;
-          const corr = diff * spring.stiff / (imA + imB);
+          const response = stretched ? spring.stiff : spring.compress;
+          const corr = diff * response / (imA + imB);
           dx *= corr;
           dy *= corr;
           a.x += dx * imA;
@@ -420,9 +447,10 @@
       const a = nodes[spring.a];
       const b = nodes[spring.b];
       const dist = Math.hypot(b.x - a.x, b.y - a.y);
-      const tension = Math.min(1, Math.abs(dist - spring.rest) / Math.max(spring.rest, 1) * 3.2);
-      const width = spring.kind === "spiral" ? 1.25 : 1.05;
-      return { alpha: 0.82 + tension * 0.18, width: width + tension * 0.45 };
+      const stretch = Math.max(0, dist - spring.rest) / Math.max(spring.rest, 1);
+      const tension = Math.min(1, stretch * 3.2);
+      const width = spring.kind === "spiral" ? 1.2 : 1.05;
+      return { alpha: 0.9, width: width + tension * 0.55 };
     }
 
     function drawBackground() {
